@@ -6,6 +6,11 @@ import Foundation
 enum FolderScanner {
     private static let progressEveryNItems = 64
 
+    /// App library bundles: recursing touches many DB files and triggers repeated TCC prompts.
+    private static let opaqueLibraryExtensions: Set<String> = [
+        "photoslibrary", "photolibrary", "musiclibrary", "tvlibrary",
+    ]
+
     private struct FileID: Hashable {
         let dev: dev_t
         let ino: ino_t
@@ -13,11 +18,13 @@ enum FolderScanner {
 
     /// - Parameters:
     ///   - root: Folder URL (must be security-scoped if sandboxed).
-    ///   - progress: Called on arbitrary threads with `(path, itemsScanned)`.
+    ///   - progress: Called on the caller's thread with `(path, itemsScanned)`.
     static func scan(
         root: URL,
         progress: @escaping @Sendable (String, Int64) -> Void
-    ) async throws -> FolderNode {
+    ) throws -> FolderNode {
+        let rootPath = (root.standardizedFileURL.path as NSString).standardizingPath
+
         var rootStat = stat()
         guard stat(root.path, &rootStat) == 0 else {
             throw NSError(
@@ -37,7 +44,7 @@ enum FolderScanner {
             }
         }
 
-        func visit(_ url: URL, name: String) async throws -> FolderNode {
+        func visit(_ url: URL, name: String) throws -> FolderNode {
             try Task.checkCancellation()
 
             var st = stat()
@@ -55,7 +62,7 @@ enum FolderScanner {
             let mode = st.st_mode & S_IFMT
 
             if mode == S_IFLNK {
-                if Self.isDirectorySymlink(url) {
+                if Self.isDirectorySymlink(url, rootStandardPath: rootPath) {
                     // Report only the symlink entry itself (a few bytes), not the target tree.
                     // Following directory symlinks would risk double-counting entire subtrees.
                     bumpProgress(path: url.path)
@@ -66,11 +73,24 @@ enum FolderScanner {
                         errorMessage: nil
                     )
                 }
-                // File symlinks: report the target's allocated size, not the symlink metadata size.
-                let bytes = Self.allocatedBytes(
-                    for: url.resolvingSymlinksInPath(),
-                    fallbackLogicalSize: Int64(st.st_size)
-                )
+                // File symlinks: size the target only when it stays under the user-selected root.
+                // Do not call resolvingSymlinksInPath() first — it can probe unsandboxed paths and
+                // trigger repeated privacy prompts.
+                let bytes: Int64
+                if let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path) {
+                    let base = url.deletingLastPathComponent()
+                    let resolved = URL(fileURLWithPath: dest, relativeTo: base).standardizedFileURL
+                    if Self.isDescendantPath(resolved.path, ofRoot: rootPath) {
+                        bytes = Self.allocatedBytes(
+                            for: resolved,
+                            fallbackLogicalSize: Int64(st.st_size)
+                        )
+                    } else {
+                        bytes = Int64(st.st_size)
+                    }
+                } else {
+                    bytes = Int64(st.st_size)
+                }
                 bumpProgress(path: url.path)
                 return FolderNode(name: name, totalBytes: bytes, children: nil, errorMessage: nil)
             }
@@ -96,6 +116,19 @@ enum FolderScanner {
                     )
                 }
 
+                if Self.isOpaqueSystemLibrary(url) {
+                    visited.insert(fid)
+                    try Task.checkCancellation()
+                    let (bytes, opaqueErr) = Self.opaqueLibraryDiskUsageBytes(at: url.path)
+                    bumpProgress(path: url.path)
+                    return FolderNode(
+                        name: name,
+                        totalBytes: bytes,
+                        children: nil,
+                        errorMessage: opaqueErr
+                    )
+                }
+
                 let (childURLs, listError) = Self.directoryContents(url)
                 if let listError {
                     bumpProgress(path: url.path)
@@ -116,7 +149,7 @@ enum FolderScanner {
                 for child in childURLs {
                     try Task.checkCancellation()
                     let childName = child.lastPathComponent
-                    let node = try await visit(child, name: childName)
+                    let node = try visit(child, name: childName)
                     children.append(node)
                     total += node.totalBytes
                 }
@@ -145,10 +178,53 @@ enum FolderScanner {
         }
 
         let rootName = root.lastPathComponent.isEmpty ? root.path : root.lastPathComponent
-        var tree = try await visit(root, name: rootName)
+        var tree = try visit(root, name: rootName)
         tree.sortChildrenBySizeDescending()
         progress(root.path, itemsScanned)
         return tree
+    }
+
+    private static func isOpaqueSystemLibrary(_ url: URL) -> Bool {
+        opaqueLibraryExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// One `du` pass instead of opening every file inside Photos/Music/TV library packages.
+    private static func opaqueLibraryDiskUsageBytes(at path: String) -> (Int64, String?) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/du")
+        p.arguments = ["-sk", path]
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        p.standardOutput = outPipe
+        p.standardError = errPipe
+
+        do {
+            try p.run()
+        } catch {
+            return (0, "Could not measure library size")
+        }
+
+        p.waitUntilExit()
+
+        if p.terminationStatus != 0 {
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let errText = String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let suffix = errText.isEmpty ? "" : ": \(errText)"
+            return (0, "Could not measure library size\(suffix)")
+        }
+
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        guard
+            let line = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(whereSeparator: \.isWhitespace).first,
+            let kb = Int64(line)
+        else {
+            return (0, "Could not parse library size")
+        }
+        return (kb * 1024, nil)
     }
 
     /// Returns directory entries, or an empty list plus a message when listing fails (e.g. permission denied).
@@ -165,11 +241,22 @@ enum FolderScanner {
         }
     }
 
-    private static func isDirectorySymlink(_ url: URL) -> Bool {
+    private static func isDescendantPath(_ path: String, ofRoot rootPath: String) -> Bool {
+        let p = (path as NSString).standardizingPath
+        let r = (rootPath as NSString).standardizingPath
+        if p == r { return true }
+        let prefix = r.hasSuffix("/") ? r : r + "/"
+        return p.hasPrefix(prefix)
+    }
+
+    private static func isDirectorySymlink(_ url: URL, rootStandardPath: String) -> Bool {
         do {
             let dest = try FileManager.default.destinationOfSymbolicLink(atPath: url.path)
             let base = url.deletingLastPathComponent()
             let resolved = URL(fileURLWithPath: dest, relativeTo: base).standardizedFileURL
+            guard isDescendantPath(resolved.path, ofRoot: rootStandardPath) else {
+                return false
+            }
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir) {
                 return isDir.boolValue

@@ -201,7 +201,10 @@
 				INFOPLIST_KEY_CFBundleDisplayName = DiskSpace;
 				INFOPLIST_KEY_CFBundleName = DiskSpace;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "DiskSpace totals folder sizes for locations you choose, including items on your Desktop.";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "DiskSpace totals folder sizes for locations you choose, including your Documents folder.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "DiskSpace may measure the on-disk size of your Photos library package when you scan your Pictures folder or home folder.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -230,7 +233,10 @@
 				INFOPLIST_KEY_CFBundleDisplayName = DiskSpace;
 				INFOPLIST_KEY_CFBundleName = DiskSpace;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSDesktopFolderUsageDescription = "DiskSpace totals folder sizes for locations you choose, including items on your Desktop.";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "DiskSpace totals folder sizes for locations you choose, including your Documents folder.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "DiskSpace may measure the on-disk size of your Photos library package when you scan your Pictures folder or home folder.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

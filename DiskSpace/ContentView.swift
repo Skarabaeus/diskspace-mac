@@ -12,6 +12,17 @@ final class ScanViewModel: ObservableObject {
 
     private var scanTask: Task<Void, Never>?
 
+    /// Holds a weak ref so the scan progress closure stays `@Sendable` without capturing `self`.
+    private final class ProgressBridge: @unchecked Sendable {
+        weak var viewModel: ScanViewModel?
+        func push(path: String, count: Int64) {
+            DispatchQueue.main.async { [weak viewModel] in
+                viewModel?.statusText = "Scanning… \(path)"
+                viewModel?.itemsScanned = count
+            }
+        }
+    }
+
     func chooseFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -49,37 +60,40 @@ final class ScanViewModel: ObservableObject {
         isScanning = true
         statusText = "Scanning…"
 
-        let accessing = url.startAccessingSecurityScopedResource()
+        // Security-scoped access is tied to the calling thread; run the whole scan on one
+        // detached task so `stat` / directory enumeration stay under the same scope and
+        // macOS does not re-prompt for the same tree on every thread hop.
+        let progressBridge = ProgressBridge()
+        progressBridge.viewModel = self
 
-        scanTask = Task { [weak self] in
-            guard let self else { return }
+        scanTask = Task.detached(priority: .userInitiated) { [url, progressBridge] in
+            let accessing = url.startAccessingSecurityScopedResource()
             defer {
                 if accessing {
                     url.stopAccessingSecurityScopedResource()
                 }
             }
             do {
-                let tree = try await FolderScanner.scan(root: url) { path, count in
-                    Task { @MainActor in
-                        self.statusText = "Scanning… \(path)"
-                        self.itemsScanned = count
-                    }
+                let tree = try FolderScanner.scan(root: url) { path, count in
+                    progressBridge.push(path: path, count: count)
                 }
                 await MainActor.run {
-                    self.rootNode = tree
-                    self.lastError = nil
-                    self.statusText = "Done."
-                    self.isScanning = false
+                    guard let vm = progressBridge.viewModel else { return }
+                    vm.rootNode = tree
+                    vm.lastError = nil
+                    vm.statusText = "Done."
+                    vm.isScanning = false
                 }
             } catch is CancellationError {
                 await MainActor.run {
-                    self.isScanning = false
+                    progressBridge.viewModel?.isScanning = false
                 }
             } catch {
                 await MainActor.run {
-                    self.lastError = error.localizedDescription
-                    self.statusText = "Failed."
-                    self.isScanning = false
+                    guard let vm = progressBridge.viewModel else { return }
+                    vm.lastError = error.localizedDescription
+                    vm.statusText = "Failed."
+                    vm.isScanning = false
                 }
             }
         }
