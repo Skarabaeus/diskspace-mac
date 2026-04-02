@@ -56,6 +56,8 @@ enum FolderScanner {
 
             if mode == S_IFLNK {
                 if Self.isDirectorySymlink(url) {
+                    // Report only the symlink entry itself (a few bytes), not the target tree.
+                    // Following directory symlinks would risk double-counting entire subtrees.
                     bumpProgress(path: url.path)
                     return FolderNode(
                         name: name,
@@ -64,7 +66,11 @@ enum FolderScanner {
                         errorMessage: nil
                     )
                 }
-                let bytes = try Self.fileSizeResolvingSymlink(url)
+                // File symlinks: report the target's allocated size, not the symlink metadata size.
+                let bytes = Self.allocatedBytes(
+                    for: url.resolvingSymlinksInPath(),
+                    fallbackLogicalSize: Int64(st.st_size)
+                )
                 bumpProgress(path: url.path)
                 return FolderNode(name: name, totalBytes: bytes, children: nil, errorMessage: nil)
             }
@@ -89,9 +95,20 @@ enum FolderScanner {
                         errorMessage: "Already visited (cycle)"
                     )
                 }
+
+                let (childURLs, listError) = Self.directoryContents(url)
+                if let listError {
+                    bumpProgress(path: url.path)
+                    return FolderNode(
+                        name: name,
+                        totalBytes: 0,
+                        children: nil,
+                        errorMessage: listError
+                    )
+                }
+
                 visited.insert(fid)
 
-                let childURLs = try Self.directoryContents(url)
                 var children: [FolderNode] = []
                 children.reserveCapacity(childURLs.count)
                 var total: Int64 = 0
@@ -109,7 +126,16 @@ enum FolderScanner {
             }
 
             if mode == S_IFREG {
-                let bytes = try Self.fileAllocatedSize(url)
+                // Deduplicate hard links: only count an inode's bytes the first time we see it.
+                if st.st_nlink > 1 {
+                    let fid = FileID(dev: st.st_dev, ino: st.st_ino)
+                    if visited.contains(fid) {
+                        bumpProgress(path: url.path)
+                        return FolderNode(name: name, totalBytes: 0, children: nil, errorMessage: "Hard link (already counted)")
+                    }
+                    visited.insert(fid)
+                }
+                let bytes = Self.allocatedBytes(for: url, fallbackLogicalSize: Int64(st.st_size))
                 bumpProgress(path: url.path)
                 return FolderNode(name: name, totalBytes: bytes, children: nil, errorMessage: nil)
             }
@@ -125,12 +151,18 @@ enum FolderScanner {
         return tree
     }
 
-    private static func directoryContents(_ url: URL) throws -> [URL] {
-        try FileManager.default.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: nil,
-            options: []
-        )
+    /// Returns directory entries, or an empty list plus a message when listing fails (e.g. permission denied).
+    private static func directoryContents(_ url: URL) -> ([URL], String?) {
+        do {
+            let urls = try FileManager.default.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+            return (urls, nil)
+        } catch {
+            return ([], error.localizedDescription)
+        }
     }
 
     private static func isDirectorySymlink(_ url: URL) -> Bool {
@@ -148,18 +180,18 @@ enum FolderScanner {
         return false
     }
 
-    private static func fileSizeResolvingSymlink(_ url: URL) throws -> Int64 {
-        try fileAllocatedSize(url.resolvingSymlinksInPath())
-    }
-
-    private static func fileAllocatedSize(_ url: URL) throws -> Int64 {
-        let values = try url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey])
-        if let alloc = values.totalFileAllocatedSize {
-            return Int64(alloc)
+    /// Uses allocated size from resource values when readable; otherwise falls back to `lstat` logical size.
+    private static func allocatedBytes(for url: URL, fallbackLogicalSize: Int64) -> Int64 {
+        do {
+            let values = try url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey])
+            if let alloc = values.totalFileAllocatedSize {
+                return Int64(alloc)
+            }
+            if let size = values.fileSize {
+                return Int64(size)
+            }
+        } catch {
         }
-        if let size = values.fileSize {
-            return Int64(size)
-        }
-        return 0
+        return fallbackLogicalSize
     }
 }
